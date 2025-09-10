@@ -75,7 +75,7 @@ model:
   g_name: GestureLSM
   do_classifier_free_guidance: False
   guidance_scale: 2
-  n_steps: 20
+  n_steps: 2
   use_exp: False
 
   denoiser:

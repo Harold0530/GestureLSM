@@ -224,11 +224,21 @@ python train.py --config configs_new/meanflow_rvqvae_128.yaml --ckpt ckpt/meanfl
 | **Shortcut** | 2-4 | Latent shortcut with reflow | Fast inference, good quality | **Recommended for most users** |
 | **MeanFlow** | 1 | Flow-based generation | Fastest inference, single step | Real-time applications |
 
-### Which Model Should I Use?
+### Performance Comparison
 
-- **For most users**: Use **Shortcut** model - it provides the best balance of quality and speed
-- **For real-time applications**: Use **MeanFlow** model - fastest inference with single-step generation
-- **For research/highest quality**: Use **Diffusion** model - best quality but slower inference
+| Model | Steps | FGD Score ↓ | Beat Constancy ↑ | L1Div Score ↓ | Inference Speed |
+|-------|-------|-------------|------------------|---------------|-----------------|
+| **MeanFlow** | 1 | **0.4031** | **0.7489** | 12.4631 | **Fastest** |
+| **Diffusion** | 20 | 0.4100 | 0.7384 | 12.5752 | Slowest |
+| **Shortcut** | 20 | 0.4040 | 0.7144 | 13.4874 | Fast |
+| **Shortcut-ReFlow** | 2 | 0.4104 | 0.7182 | **13.678** | Fast |
+
+**Legend**: 
+- **FGD Score** (↓): Lower is better - measures gesture quality
+- **Beat Constancy** (↑): Higher is better - measures audio-gesture synchronization  
+- **L1Div Score** (↑): Higher is better - measures diversity of generated gestures
+
+**Recommendation**: **MeanFlow** is the clear winner, offering the best FGD and L1Div scores with the fastest inference speed.
 
 ### Legacy Testing (Deprecated)
 > For reference only - use the unified pipeline above instead
