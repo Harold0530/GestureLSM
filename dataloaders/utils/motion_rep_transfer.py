@@ -149,7 +149,7 @@ def get_motion_rep_numpy(poses_np, pose_fps=30, device="cuda", expressions=None,
         "rep15d": rep15d,
     }
 
-def process_smplx_motion(pose_file, smplx_model, joint_mask, pose_fps, facial_rep=None):
+def process_smplx_motion(pose_file, smplx_model, pose_fps, facial_rep=None):
     """Process SMPLX pose and facial data together."""
     pose_data = np.load(pose_file, allow_pickle=True)
     stride = int(30/pose_fps)
@@ -174,17 +174,14 @@ def process_smplx_motion(pose_file, smplx_model, joint_mask, pose_fps, facial_re
     # Process shape data
     shape = np.repeat(pose_data["betas"].reshape(1, 300), pose_frames.shape[0], axis=0)
     
-    # Calculate contacts
-    contacts = calculate_foot_contacts(pose_data, smplx_model)
+    # # Calculate contacts
+    # contacts = calculate_foot_contacts(pose_data, smplx_model)
     
-    # Apply joint masking and combine with contacts
-    masked_pose = pose_frames * joint_mask
-    masked_pose = masked_pose[:, joint_mask.astype(bool)]
-    if contacts is not None:
-        masked_pose = np.concatenate([masked_pose, contacts], axis=1)
+    # if contacts is not None:
+    #     pose_data = np.concatenate([pose_data, contacts], axis=1)
     
     return {
-        'pose': masked_pose,
+        'pose': pose_frames,
         'trans': trans,
         'trans_v': trans_v,
         'shape': shape,

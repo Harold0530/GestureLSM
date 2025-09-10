@@ -27,5 +27,7 @@ trimesh
 imageio
 moviepy
 huggingface_hub
-diffusers==0.24.0
-numpy==1.24.2
+diffusers==0.32.0
+numpy==1.26.2
+wget
+rich

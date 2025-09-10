@@ -623,11 +623,11 @@ def render_one_sequence(
 
 def print_exp_info(args):
     logger.info(pprint.pformat(vars(args)))
-    logger.info(f"# ------------ {args.name} ----------- #")
+    logger.info(f"# ------------ {args.exp_name} ----------- #")
     logger.info("PyTorch version: {}".format(torch.__version__))
     logger.info("CUDA version: {}".format(torch.version.cuda))
     logger.info("{} GPUs".format(torch.cuda.device_count()))
-    logger.info(f"Random Seed: {args.random_seed}")
+    logger.info(f"Random Seed: {args.seed}")
 
 def args2csv(args, get_head=False, list4print=[]):
     for k, v in args.items():

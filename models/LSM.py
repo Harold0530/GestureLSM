@@ -11,6 +11,7 @@ from typing import Dict
 import math
 import torch
 import torch.distributions as dist
+import torch.nn as nn
 
 import torch
 import torch.nn.functional as F
@@ -124,16 +125,136 @@ class GestureLSM(torch.nn.Module):
         self.do_classifier_free_guidance = cfg.model.do_classifier_free_guidance
         self.guidance_scale = cfg.model.guidance_scale
         self.num_inference_steps = cfg.model.n_steps
-        self.exponential_distribution = ExponentialPDF(a=0, b=1, name='ExponentialPDF')
 
         # Loss functions
         self.smooth_l1_loss = torch.nn.SmoothL1Loss(reduction='none')
         
-        self.num_joints = 3 if not self.cfg.model.use_exp else 4
+        self.num_joints = self.denoiser.joint_num
+        
+        self.seq_len = self.denoiser.seq_len
+        self.input_dim = self.denoiser.input_dim
+        
+        # Flow matching mode: 'v' for velocity prediction, 'x1' for direct position prediction
+        self.flow_mode = cfg.model.get("flow_mode", "v")
+        assert self.flow_mode in [
+            "v",
+            "x1",
+        ], f"Flow mode must be 'v' or 'x1', got {self.flow_mode}"
+        logger.info(f"Using flow mode: {self.flow_mode}")
+        
+
 
     def summarize_parameters(self) -> None:
         logger.info(f'Denoiser: {count_parameters(self.denoiser)}M')
         logger.info(f'Encoder: {count_parameters(self.modality_encoder)}M')
+    
+    def apply_classifier_free_guidance(self, x, timesteps, seed, at_feat, cond_time=None, guidance_scale=1.0):
+        """
+        Apply classifier-free guidance by running both conditional and unconditional predictions.
+        
+        Args:
+            x: Input tensor
+            timesteps: Timestep tensor
+            seed: Seed vectors
+            at_feat: Audio features
+            cond_time: Conditional time tensor
+            guidance_scale: Guidance scale (1.0 means no guidance)
+            
+        Returns:
+            Guided output tensor
+        """
+        if guidance_scale <= 1.0:
+            # No guidance needed, run normal forward pass
+            return self.denoiser(
+                x=x,
+                timesteps=timesteps,
+                seed=seed,
+                at_feat=at_feat,
+                cond_time=cond_time,
+            )
+        
+        # Double the batch for classifier free guidance
+        x_doubled = torch.cat([x] * 2, dim=0)
+        seed_doubled = torch.cat([seed] * 2, dim=0)
+        at_feat_doubled = torch.cat([at_feat] * 2, dim=0)
+        
+        # Properly expand timesteps to match doubled batch size
+        batch_size = x.shape[0]
+        timesteps_doubled = timesteps.expand(batch_size * 2)
+        
+        if cond_time is not None:
+            cond_time_doubled = cond_time.expand(batch_size * 2)
+        else:
+            cond_time_doubled = None
+        
+        # Create conditional and unconditional audio features
+        batch_size = at_feat.shape[0]
+        null_cond_embed = self.denoiser.null_cond_embed.to(at_feat.dtype)
+        at_feat_uncond = null_cond_embed.unsqueeze(0).expand(batch_size, -1, -1)
+        at_feat_combined = torch.cat([at_feat, at_feat_uncond], dim=0)
+        
+        # Run both conditional and unconditional predictions
+        output = self.denoiser(
+            x=x_doubled,
+            timesteps=timesteps_doubled,
+            seed=seed_doubled,
+            at_feat=at_feat_combined,
+            cond_time=cond_time_doubled,
+        )
+        
+        # Split predictions and apply guidance
+        pred_cond, pred_uncond = output.chunk(2, dim=0)
+        guided_output = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+        
+        return guided_output
+    
+    def apply_conditional_dropout(self, at_feat, cond_drop_prob=0.1):
+        """
+        Apply conditional dropout during training to simulate classifier-free guidance.
+        
+        Args:
+            at_feat: Audio features tensor
+            cond_drop_prob: Probability of dropping conditions (default 0.1)
+            
+        Returns:
+            Modified audio features with some conditions replaced by null embeddings
+        """
+        batch_size = at_feat.shape[0]
+        
+        # Create dropout mask
+        keep_mask = torch.rand(batch_size, device=at_feat.device) > cond_drop_prob
+        
+        # Create null condition embeddings
+        null_cond_embed = self.denoiser.null_cond_embed.to(at_feat.dtype)
+        
+        # Apply dropout: replace dropped conditions with null embeddings
+        at_feat_dropped = at_feat.clone()
+        at_feat_dropped[~keep_mask] = null_cond_embed.unsqueeze(0).expand((~keep_mask).sum(), -1, -1)
+        
+        return at_feat_dropped
+    
+    def apply_force_cfg(self, at_feat, force_cfg):
+        """
+        Apply forced conditional dropout based on the force_cfg mask.
+        
+        Args:
+            at_feat: Audio features tensor
+            force_cfg: Boolean mask indicating which samples should use null conditions
+            
+        Returns:
+            Modified audio features with forced conditions replaced by null embeddings
+        """
+        batch_size = at_feat.shape[0]
+        
+        # Create null condition embeddings
+        null_cond_embed = self.denoiser.null_cond_embed.to(at_feat.dtype)
+        
+        # Apply forced dropout: replace forced conditions with null embeddings
+        at_feat_forced = at_feat.clone()
+        force_cfg_tensor = torch.tensor(force_cfg, device=at_feat.device)
+        at_feat_forced[force_cfg_tensor] = null_cond_embed.unsqueeze(0).expand(force_cfg_tensor.sum(), -1, -1)
+        
+        return at_feat_forced
     
     def forward(self, condition_dict: Dict[str, Dict]) -> Dict[str, torch.Tensor]:
         """Forward pass for inference.
@@ -146,11 +267,10 @@ class GestureLSM(torch.nn.Module):
             Dictionary containing generated latents
         """
         # Extract input features
-        audio = condition_dict['y']['audio']
+        audio = condition_dict['y']['audio_onset']
         word_tokens = condition_dict['y']['word']
         ids = condition_dict['y']['id']
         seed_vectors = condition_dict['y']['seed']
-        mask = condition_dict['y']['mask']
         style_features = condition_dict['y']['style_feature']
         if 'wavlm' in condition_dict['y']:
             wavlm_features = condition_dict['y']['wavlm']
@@ -166,10 +286,8 @@ class GestureLSM(torch.nn.Module):
 
         # Initialize generation
         batch_size = audio_features.shape[0]
-        latent_shape = (batch_size, 128 * self.num_joints, 1, 32)
+        latent_shape = (batch_size, self.input_dim * self.num_joints, 1, self.seq_len)
 
-        
-        
         # Sampling parameters
         x_t = torch.randn(latent_shape, device=audio_features.device)
 
@@ -185,7 +303,7 @@ class GestureLSM(torch.nn.Module):
             current_delta = delta_t.unsqueeze(0)
             
             with torch.no_grad():
-                speed = self.denoiser.forward_with_cfg(
+                model_output = self.apply_classifier_free_guidance(
                     x=x_t,
                     timesteps=current_t,
                     seed=seed_vectors,
@@ -194,84 +312,16 @@ class GestureLSM(torch.nn.Module):
                     guidance_scale=self.guidance_scale
                 )
                
-            x_t = x_t + (timesteps[step] - timesteps[step - 1]) * speed
+                if self.flow_mode == "v":
+                    # Velocity prediction mode (original)
+                    # Update x_t using the predicted velocity field
+                    x_t = x_t + (timesteps[step] - timesteps[step - 1]) * model_output
+                else:  # 'x1' mode
+                    # Direct position prediction mode
+                    x_t = x_t + (timesteps[step] - timesteps[step - 1]) * (model_output - return_dict['init_noise'])
+                    
         return_dict['latents'] = x_t
         return return_dict
-    
-    def forward_calculate_loss(self, condition_dict: Dict[str, Dict], latents: torch.Tensor, save_path: str, iter: int) -> Dict[str, torch.Tensor]:
-        """Compute losses for the forward pass.
-        
-        Args:
-            condition_dict: Dictionary containing input conditions
-            latents: Target latent vectors
-        
-        Returns:
-            Dictionary containing individual and total losses
-        """
-        # Extract input features
-        audio = condition_dict['y']['audio']
-        raw_audio = condition_dict['y']['wavlm']
-        word_tokens = condition_dict['y']['word']
-        instance_ids = condition_dict['y']['id']
-        seed_vectors = condition_dict['y']['seed']
-        attention_mask = condition_dict['y']['mask']
-        style_features = condition_dict['y']['style_feature']
-    
-        # Encode input modalities
-        audio_features = self.modality_encoder(audio, word_tokens, raw_audio)
-
-        # Initialize noise
-        x0_noise = torch.randn_like(latents)
-
-        # Sample timesteps and deltas
-        deltas = 1 / torch.tensor([2 ** i for i in range(1, 8)]).to(latents.device)
-        delta_probs = torch.ones((deltas.shape[0],)).to(latents.device) / deltas.shape[0]
-
-        batch_size = latents.shape[0]
-        flow_batch_size = int(batch_size * 3/4)
-
-        # Sample random coefficients
-        epsilon = 1e-8
-
-        timesteps = torch.linspace(epsilon, 1 - epsilon, 50 + 1).to(audio_features.device)
-
-        losses = {}
-        for step in range(1, len(timesteps)):
-            t = timesteps[step - 1].unsqueeze(0).repeat((batch_size,))
-
-            # t = sample_t_fast(batch_size).to(latents.device)
-            d = deltas[delta_probs.multinomial(batch_size, replacement=True)]
-            d[:flow_batch_size] = 0
-
-            # Prepare inputs
-            t_coef = reshape_coefs(t)
-            x_t = t_coef * latents + (1 - t_coef) * x0_noise
-            t = t_coef.flatten()
-            
-            # Flow matching loss
-            flow_pred = self.denoiser(
-                x=x_t[:flow_batch_size],
-                timesteps=t[:flow_batch_size],
-                seed=seed_vectors[:flow_batch_size],
-                at_feat=audio_features[:flow_batch_size],
-                cond_time=d[:flow_batch_size],
-            )
-            
-            flow_target = latents[:flow_batch_size] - x0_noise[:flow_batch_size]
-            
-            flow_loss = F.mse_loss(flow_target, flow_pred, reduction='none').mean(dim=(1, 2, 3))
-            
-            losses[t[0].item()] = flow_loss.tolist()
-
-
-        #plot this loss
-        # save this loss into a csv file
-        with open(save_path + f'loss_{iter}.csv', 'w') as f:
-            for key, loss_vals in losses.items():
-                loss_vals_str = "\t".join(map(str, loss_vals))
-                f.write(f"{key}\t{loss_vals_str}\n")
-
-        return losses
     
     def train_forward(self, condition_dict: Dict[str, Dict], 
                               latents: torch.Tensor, train_consistency=False) -> Dict[str, torch.Tensor]:
@@ -286,16 +336,14 @@ class GestureLSM(torch.nn.Module):
         """
 
         # Extract input features
-        audio = condition_dict['y']['audio']
-        raw_audio = condition_dict['y']['wavlm']
+        audio = condition_dict['y']['audio_onset']
         word_tokens = condition_dict['y']['word']
         instance_ids = condition_dict['y']['id']
         seed_vectors = condition_dict['y']['seed']
-        mask = condition_dict['y']['mask']
         style_features = condition_dict['y']['style_feature']
     
         # Encode input modalities
-        audio_features = self.modality_encoder(audio, word_tokens, raw_audio)
+        audio_features = self.modality_encoder(audio, word_tokens)
 
         # Initialize noise
         x0_noise = torch.randn_like(latents)
@@ -306,6 +354,9 @@ class GestureLSM(torch.nn.Module):
 
         batch_size = latents.shape[0]
         flow_batch_size = int(batch_size * 3/4)
+
+        # Apply conditional dropout during training for flow matching loss
+        audio_features_flow = self.apply_conditional_dropout(audio_features[:flow_batch_size], cond_drop_prob=0.1)
 
         # Sample random coefficients
         t = sample_beta_distribution(batch_size, alpha=2, beta=1.2).to(latents.device)
@@ -319,61 +370,86 @@ class GestureLSM(torch.nn.Module):
         t = t_coef.flatten()
         
         # Flow matching loss
-        flow_pred = self.denoiser(
+        model_output = self.denoiser(
             x=x_t[:flow_batch_size],
             timesteps=t[:flow_batch_size],
             seed=seed_vectors[:flow_batch_size],
-            at_feat=audio_features[:flow_batch_size],
+            at_feat=audio_features_flow,
             cond_time=d[:flow_batch_size],
         )
         
-        flow_target = latents[:flow_batch_size] - x0_noise[:flow_batch_size]
-        
         losses = {}
-        flow_loss = (F.mse_loss(flow_target, flow_pred) / t).mean()
-        losses['flow_loss'] = flow_loss
+        
+        if self.flow_mode == "v":
+            # Velocity prediction mode (original)
+            flow_target = latents[:flow_batch_size] - x0_noise[:flow_batch_size]
+            flow_loss = (
+                F.mse_loss(flow_target, model_output) / t[:flow_batch_size]
+            ).mean()
+        else:  # 'x1' mode
+            # Direct position prediction mode
+            flow_target = latents[:flow_batch_size]
+            flow_loss = (F.mse_loss(flow_target, model_output) / t[:flow_batch_size]).mean()
+
+        losses["flow_loss"] = flow_loss
 
         # Consistency loss computation
         # Jan 11, perform cfg at the same time, 50% true and 50% false
-        force_cfg = np.random.choice([True, False], size=batch_size-flow_batch_size, p=[0.8, 0.2])
+        force_cfg = np.random.choice(
+            [True, False], size=batch_size - flow_batch_size, p=[0.8, 0.2]
+        )
+        
+        # Apply force_cfg externally
+        audio_features_consistency = self.apply_force_cfg(audio_features[flow_batch_size:], force_cfg)
+        
         with torch.no_grad():
-            speed_t = self.denoiser(
+            pred_t = self.denoiser(
                 x=x_t[flow_batch_size:],
                 timesteps=t[flow_batch_size:],
                 seed=seed_vectors[flow_batch_size:],
-                at_feat=audio_features[flow_batch_size:],
+                at_feat=audio_features_consistency,
                 cond_time=d[flow_batch_size:],
-                force_cfg=force_cfg,
             )
             
             d_coef = reshape_coefs(d)
+            if self.flow_mode == "v":
+                speed_t = pred_t
+            else:
+                speed_t = speed_t - x0_noise
             x_td = x_t[flow_batch_size:] + d_coef[flow_batch_size:] * speed_t
+            
             d = d_coef.flatten()
 
-            speed_td = self.denoiser(
+            pred_td = self.denoiser(
                 x=x_td,
                 timesteps=t[flow_batch_size:] + d[flow_batch_size:],
                 seed=seed_vectors[flow_batch_size:],
-                at_feat=audio_features[flow_batch_size:],
+                at_feat=audio_features_consistency,
                 cond_time=d[flow_batch_size:],
-                force_cfg=force_cfg,
             )
+            if self.flow_mode == "v":
+                speed_td = pred_td
+            else:
+                speed_td = speed_t - x0_noise
             
             speed_target = (speed_t + speed_td) / 2
-        
-        speed_pred = self.denoiser(
+
+        model_pred = self.denoiser(
             x=x_t[flow_batch_size:],
             timesteps=t[flow_batch_size:],
             seed=seed_vectors[flow_batch_size:],
-            at_feat=audio_features[flow_batch_size:],
+            at_feat=audio_features_consistency,
             cond_time=2 * d[flow_batch_size:],
-            force_cfg=force_cfg,
         )
-        
-        consistency_loss = F.mse_loss(speed_pred, speed_target, reduction="mean")
-        losses['consistency_loss'] = consistency_loss
+        if self.flow_mode == "v":
+            speed_pred = model_pred
+        else:
+            speed_pred = model_pred - x0_noise
 
-        losses['loss'] = sum(losses.values())
+        consistency_loss = F.mse_loss(speed_pred, speed_target, reduction="mean")
+        losses["consistency_loss"] = consistency_loss
+
+        losses["loss"] = sum(losses.values())
         return losses
     
 
@@ -431,7 +507,6 @@ class GestureLSM(torch.nn.Module):
                 seed=seed_vectors[flow_batch_size:],
                 at_feat=audio_features[flow_batch_size:],
                 cond_time=d[flow_batch_size:],
-                force_cfg=force_cfg,
             )
             
             d_coef = reshape_coefs(d)
@@ -444,7 +519,6 @@ class GestureLSM(torch.nn.Module):
                 seed=seed_vectors[flow_batch_size:],
                 at_feat=audio_features[flow_batch_size:],
                 cond_time=d[flow_batch_size:],
-                force_cfg=force_cfg,
             )
             
             speed_target = (speed_t + speed_td) / 2
@@ -455,7 +529,6 @@ class GestureLSM(torch.nn.Module):
             seed=seed_vectors[flow_batch_size:],
             at_feat=audio_features[flow_batch_size:],
             cond_time=2 * d[flow_batch_size:],
-            force_cfg=force_cfg,
         )
         
         consistency_loss = F.mse_loss(speed_pred, speed_target, reduction="mean")
@@ -463,30 +536,3 @@ class GestureLSM(torch.nn.Module):
 
         losses['loss'] = sum(losses.values())
         return losses
-
-
-
-    def masked_l2(self, a, b, mask, reduction='mean'):
-        loss = self.smooth_l1_loss(a, b)
-        loss = sum_flat(loss * mask.float())  # gives \sigma_euclidean over unmasked elements
-        n_entries = a.shape[1] * a.shape[2]
-        non_zero_elements = sum_flat(mask) * n_entries
-        mse_loss_val = loss / non_zero_elements
-
-        if reduction == 'mean':
-            mse_loss_val = mse_loss_val.mean()
-        elif reduction == 'sum':
-            mse_loss_val = mse_loss_val.sum()
-        return mse_loss_val
-    
-    def huber_loss(self, a, b, reduction='mean'):
-        data_dim = a.shape[1] * a.shape[2] * a.shape[3]
-        huber_c = 0.00054 * data_dim
-        loss = torch.sum((a - b) ** 2, dim=(1, 2, 3))
-        loss = torch.sqrt(loss + huber_c**2) - huber_c
-        loss = loss / data_dim
-        if reduction == 'mean':
-            loss = loss.mean()
-        elif reduction == 'sum':
-            loss = loss.sum()
-        return loss

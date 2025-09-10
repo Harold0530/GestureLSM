@@ -76,6 +76,33 @@ class DropPath(nn.Module):
     def extra_repr(self):
         return f'drop_prob={round(self.drop_prob,3):0.3f}'
 
+
+class OutputHead(nn.Module):
+
+    def __init__(self, dim, out_dim, eps=1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+
+        # layers
+        self.norm = nn.LayerNorm(dim, eps)
+        self.head = nn.Linear(dim, out_dim)
+
+        # modulation
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+
+    def forward(self, x, e):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L1, C]
+            e(Tensor): Shape [B, C]
+        """
+        # assert e.dtype == torch.float32
+        # with amp.autocast(dtype=torch.float32):
+        e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+        x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+        return x
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
@@ -95,6 +122,7 @@ class Attention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.fused_attn = use_fused_attn()
+        self._force_no_fused_attn = False  # Add flag to force disable fused attention
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -103,13 +131,20 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+    def set_force_no_fused_attn(self, force_no_fused: bool):
+        """Temporarily force disable fused attention for forward AD compatibility."""
+        self._force_no_fused_attn = force_no_fused
+
     def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.fused_attn:
+        # Use fused attention only if both conditions are met
+        use_fused = self.fused_attn and not self._force_no_fused_attn
+        
+        if use_fused:
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.attn_drop.p,
@@ -145,6 +180,7 @@ class CrossAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.fused_attn = use_fused_attn()
+        self._force_no_fused_attn = False  # Add flag to force disable fused attention
 
         # Instead of a combined QKV projection, we have separate Q and KV projections
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
@@ -155,6 +191,10 @@ class CrossAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+
+    def set_force_no_fused_attn(self, force_no_fused: bool):
+        """Temporarily force disable fused attention for forward AD compatibility."""
+        self._force_no_fused_attn = force_no_fused
 
     def forward(self, x, context):
         """
@@ -175,7 +215,10 @@ class CrossAttention(nn.Module):
         # Apply normalization if specified
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.fused_attn:
+        # Use fused attention only if both conditions are met
+        use_fused = self.fused_attn and not self._force_no_fused_attn
+        
+        if use_fused:
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.attn_drop.p,

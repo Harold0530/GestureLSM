@@ -4,11 +4,11 @@ import math
 import shutil
 import numpy as np
 import lmdb as lmdb
+import textgrid as tg
 import pandas as pd
 import torch
 import glob
 import json
-from dataloaders.build_vocab import Vocab
 from termcolor import colored
 from loguru import logger
 from collections import defaultdict
@@ -16,29 +16,19 @@ from torch.utils.data import Dataset
 import torch.distributed as dist
 import pickle
 import smplx
-from .utils.audio_features import process_audio_data
-from .data_tools import joints_list
+from .utils.audio_features import AudioProcessor
 from .utils.other_tools import MultiLMDBManager
 from .utils.motion_rep_transfer import process_smplx_motion
 from .utils.mis_features import process_semantic_data, process_emotion_data
 from .utils.text_features import process_word_data
 from .utils.data_sample import sample_from_clip
-import time
-
+from .utils import rotation_conversions as rc
 
 class CustomDataset(Dataset):
-    def __init__(self, args, loader_type, augmentation=None, kwargs=None, build_cache=True):
+    def __init__(self, args, loader_type, build_cache=True):
         self.args = args
         self.loader_type = loader_type
-        
-        # Set rank safely - handle cases where distributed training is not yet initialized
-        try:
-            if torch.distributed.is_initialized():
-                self.rank = torch.distributed.get_rank()
-            else:
-                self.rank = 0
-        except:
-            self.rank = 0
+        self.rank = dist.get_rank()
         
         self.ori_stride = self.args.stride
         self.ori_length = self.args.pose_length
@@ -48,7 +38,7 @@ class CustomDataset(Dataset):
         self.ori_length = self.args.pose_length
         self.alignment = [0,0]  # for trinity
         
-        """Initialize SMPLX model."""
+        # Initialize SMPLX model
         self.smplx = smplx.create(
             self.args.data_path_1+"smplx_models/", 
             model_type='smplx',
@@ -60,23 +50,17 @@ class CustomDataset(Dataset):
             use_pca=False,
         ).cuda().eval()
         
-        if self.args.word_rep is not None:
-            with open(f"{self.args.data_path}weights/vocab.pkl", 'rb') as f:
-                self.lang_model = pickle.load(f)
+        self.avg_vel = np.load(args.data_path+f"weights/mean_vel_{args.pose_rep}.npy")
         
         # Load and process split rules
         self._process_split_rules()
         
         # Initialize data directories and lengths
         self._init_data_paths()
-
-        if self.args.beat_align:
-            if not os.path.exists(args.data_path+f"weights/mean_vel_{args.pose_rep}.npy"):
-                self.calculate_mean_velocity(args.data_path+f"weights/mean_vel_{args.pose_rep}.npy")
-            self.avg_vel = np.load(args.data_path+f"weights/mean_vel_{args.pose_rep}.npy")
         
         # Build or load cache
         self._init_cache(build_cache)
+        
     
     def _process_split_rules(self):
         """Process dataset split rules."""
@@ -119,6 +103,8 @@ class CustomDataset(Dataset):
         else:
             self.preloaded_dir = self.args.root_path + self.args.cache_path + self.loader_type + f"/{self.args.pose_rep}_cache"
     
+    
+    
     def _init_cache(self, build_cache):
         """Initialize or build cache."""
         self.lmdb_envs = {}
@@ -126,18 +112,6 @@ class CustomDataset(Dataset):
         
         if build_cache and self.rank == 0:
             self.build_cache(self.preloaded_dir)
-        
-        # In DDP mode, ensure all processes wait for cache building to complete
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        
-        # Try to regenerate cache if corrupted (only on rank 0 to avoid race conditions)
-        if self.rank == 0:
-            self.regenerate_cache_if_corrupted()
-        
-        # Wait for cache regeneration to complete
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
         
         self.load_db_mapping()
     
@@ -179,6 +153,8 @@ class CustomDataset(Dataset):
         if not os.path.exists(out_lmdb_dir):
             os.makedirs(out_lmdb_dir)
         
+        self.audio_processor = AudioProcessor(layer=self.args.n_layer, use_distill=self.args.use_distill)
+        
         # Initialize the multi-LMDB manager
         lmdb_manager = MultiLMDBManager(out_lmdb_dir, max_db_size=10*1024*1024*1024)
         
@@ -194,21 +170,27 @@ class CustomDataset(Dataset):
             data = self._process_file_data(f_name, pose_file, ext)
             if data is None:
                 continue
-            
+                
             # Sample from clip
             filtered_result, self.n_out_samples = sample_from_clip(
                 lmdb_manager=lmdb_manager,
                 audio_file=pose_file.replace(self.args.pose_rep, 'wave16k').replace(ext, ".wav"),
-                audio_each_file=data['audio'],
+                audio_each_file=data['audio_tensor'],
+                high_each_file=data['high_level'],
+                low_each_file=data['low_level'],
                 pose_each_file=data['pose'],
+                rep15d_each_file=data['rep15d'],
                 trans_each_file=data['trans'],
                 trans_v_each_file=data['trans_v'],
                 shape_each_file=data['shape'],
                 facial_each_file=data['facial'],
-                word_each_file=data['word'],
+                aligned_text_each_file=data['aligned_text'],
+                word_each_file=data['word'] if self.args.word_rep is not None else None,
                 vid_each_file=data['vid'],
                 emo_each_file=data['emo'],
                 sem_each_file=data['sem'],
+                intention_each_file=data['intention'] if data['intention'] is not None else None,
+                audio_onset_each_file=data['audio_onset'] if self.args.onset_rep else None,
                 args=self.args,
                 ori_stride=self.ori_stride,
                 ori_length=self.ori_length,
@@ -254,9 +236,17 @@ class CustomDataset(Dataset):
         # Process audio if needed
         if self.args.audio_rep is not None:
             audio_file = pose_file.replace(self.args.pose_rep, 'wave16k').replace(ext, ".wav")
-            data = process_audio_data(audio_file, self.args, data, f_name, self.selected_file)
-            if data is None:
+            audio_data = self.audio_processor.get_wav2vec_from_16k_wav(audio_file, aligned_text=True)
+            if audio_data is None:
                 return None
+            data.update(audio_data)
+        
+        if getattr(self.args, "onset_rep", False):
+            audio_file = pose_file.replace(self.args.pose_rep, 'wave16k').replace(ext, ".wav")
+            onset_data = self.audio_processor.calculate_onset_amplitude(audio_file, data)
+            if onset_data is None:
+                return None
+            data.update(onset_data)
         
         # Process emotion if needed
         if self.args.emo_rep is not None:
@@ -267,9 +257,10 @@ class CustomDataset(Dataset):
         # Process word data if needed
         if self.args.word_rep is not None:
             word_file = f"{self.data_dir}{self.args.word_rep}/{f_name}.TextGrid"
-            data = process_word_data(self.data_dir, word_file, self.args, data, f_name, self.selected_file, self.lang_model)
+            data = process_word_data(self.data_dir, word_file, self.args, data, f_name, self.selected_file)
             if data is None:
                 return None
+        
         
         # Process semantic data if needed
         if self.args.sem_rep is not None:
@@ -283,51 +274,9 @@ class CustomDataset(Dataset):
     def load_db_mapping(self):
         """Load database mapping from file."""
         mapping_path = os.path.join(self.preloaded_dir, "sample_db_mapping.pkl")
-        backup_path = os.path.join(self.preloaded_dir, "sample_db_mapping_backup.pkl")
+        with open(mapping_path, 'rb') as f:
+            self.mapping_data = pickle.load(f)
         
-        # Check if file exists and is readable
-        if not os.path.exists(mapping_path):
-            raise FileNotFoundError(f"Mapping file not found: {mapping_path}")
-        
-        # Check file size to ensure it's not empty
-        file_size = os.path.getsize(mapping_path)
-        if file_size == 0:
-            raise ValueError(f"Mapping file is empty: {mapping_path}")
-        
-        print(f"Loading mapping file: {mapping_path} (size: {file_size} bytes)")
-        
-        # Add error handling and retry logic for pickle loading
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                with open(mapping_path, 'rb') as f:
-                    self.mapping_data = pickle.load(f)
-                print(f"Successfully loaded mapping data with {len(self.mapping_data.get('mapping', []))} samples")
-                break
-            except (EOFError, pickle.UnpicklingError) as e:
-                if attempt < max_retries - 1:
-                    print(f"Warning: Failed to load pickle file (attempt {attempt + 1}/{max_retries}): {e}")
-                    print(f"File path: {mapping_path}")
-                    
-                    # Try backup file if main file is corrupted
-                    if os.path.exists(backup_path) and os.path.getsize(backup_path) > 0:
-                        print("Trying backup file...")
-                        try:
-                            with open(backup_path, 'rb') as f:
-                                self.mapping_data = pickle.load(f)
-                            print(f"Successfully loaded mapping data from backup with {len(self.mapping_data.get('mapping', []))} samples")
-                            break
-                        except Exception as backup_e:
-                            print(f"Backup file also failed: {backup_e}")
-                    
-                    print("Retrying...")
-                    time.sleep(1)  # Wait a bit before retrying
-                else:
-                    print(f"Error: Failed to load pickle file after {max_retries} attempts: {e}")
-                    print(f"File path: {mapping_path}")
-                    print("Please check if the file is corrupted or incomplete.")
-                    print("You may need to regenerate the cache files.")
-                    raise
         
         # Update paths from test to test_clip if needed
         if self.loader_type == "test" and self.args.test_clip:
@@ -336,10 +285,10 @@ class CustomDataset(Dataset):
                 updated_path = path.replace("test/", "test_clip/")
                 updated_paths.append(updated_path)
             self.mapping_data['db_paths'] = updated_paths
-            
-            # In DDP mode, avoid modifying shared files to prevent race conditions
-            # Instead, just update the in-memory data
-            print(f"Updated test paths for test_clip mode (avoiding file modification in DDP)")
+        
+            # Re-save the updated mapping_data to the same pickle file
+            with open(mapping_path, 'wb') as f:
+                pickle.dump(self.mapping_data, f)
         
         self.n_samples = len(self.mapping_data['mapping'])
     
@@ -364,30 +313,34 @@ class CustomDataset(Dataset):
             sample = txn.get(key)
             sample = pickle.loads(sample)
             
-            tar_pose, in_audio, in_facial, in_shape, in_word, emo, sem, vid, trans, trans_v, audio_name = sample
+            
+            tar_pose, in_audio, in_audio_high, in_audio_low, tar_rep15d, in_facial, in_shape, in_aligned_text, in_word, emo, sem, vid, trans, trans_v, intention, audio_name, audio_onset = sample
+            
             
             # Convert data to tensors with appropriate types
             processed_data = self._convert_to_tensors(
-                tar_pose, in_audio, in_facial, in_shape, in_word,
-                emo, sem, vid, trans, trans_v
+                tar_pose, tar_rep15d, in_audio, in_audio_high, in_audio_low, in_facial, in_shape, in_aligned_text, in_word,
+                emo, sem, vid, trans, trans_v, intention, audio_onset
             )
             
             processed_data['audio_name'] = audio_name
             return processed_data
     
-    def _convert_to_tensors(self, tar_pose, in_audio, in_facial, in_shape, in_word,
-                           emo, sem, vid, trans, trans_v):
+    def _convert_to_tensors(self, tar_pose, tar_rep15d, in_audio, in_audio_high, in_audio_low, in_facial, in_shape, in_aligned_text, in_word,
+                           emo, sem, vid, trans, trans_v, intention=None, audio_onset=None):
         """Convert numpy arrays to tensors with appropriate types."""
         data = {
             'emo': torch.from_numpy(emo).int(),
             'sem': torch.from_numpy(sem).float(),
-            'audio_onset': torch.from_numpy(in_audio).float(),
-            'word': torch.from_numpy(in_word).int()
+            'audio_tensor': torch.from_numpy(in_audio).float(),
+            'bert_time_aligned': torch.from_numpy(in_aligned_text).float()
         }
+        tar_pose = torch.from_numpy(tar_pose).float()
         
         if self.loader_type == "test":
             data.update({
-                'pose': torch.from_numpy(tar_pose).float(),
+                'pose': tar_pose,
+                'rep15d': torch.from_numpy(tar_rep15d).float(),
                 'trans': torch.from_numpy(trans).float(),
                 'trans_v': torch.from_numpy(trans_v).float(),
                 'facial': torch.from_numpy(in_facial).float(),
@@ -396,7 +349,8 @@ class CustomDataset(Dataset):
             })
         else:
             data.update({
-                'pose': torch.from_numpy(tar_pose).reshape((tar_pose.shape[0], -1)).float(),
+                'pose': tar_pose,
+                'rep15d': torch.from_numpy(tar_rep15d).reshape((tar_rep15d.shape[0], -1)).float(),
                 'trans': torch.from_numpy(trans).reshape((trans.shape[0], -1)).float(),
                 'trans_v': torch.from_numpy(trans_v).reshape((trans_v.shape[0], -1)).float(),
                 'facial': torch.from_numpy(in_facial).reshape((in_facial.shape[0], -1)).float(),
@@ -404,27 +358,16 @@ class CustomDataset(Dataset):
                 'beta': torch.from_numpy(in_shape).reshape((in_shape.shape[0], -1)).float()
             })
         
+        
+        # Handle audio onset
+        if audio_onset is not None:
+            data['audio_onset'] = torch.from_numpy(audio_onset).float()
+        else:
+            data['audio_onset'] = torch.tensor([-1])
+        
+        if in_word is not None:
+            data['word'] = torch.from_numpy(in_word).int()
+        else:
+            data['word'] = torch.tensor([-1])
+        
         return data
-
-    def regenerate_cache_if_corrupted(self):
-        """Regenerate cache if the pickle file is corrupted."""
-        mapping_path = os.path.join(self.preloaded_dir, "sample_db_mapping.pkl")
-        
-        if os.path.exists(mapping_path):
-            try:
-                # Try to load the file to check if it's corrupted
-                with open(mapping_path, 'rb') as f:
-                    test_data = pickle.load(f)
-                return False  # File is not corrupted
-            except (EOFError, pickle.UnpicklingError):
-                print(f"Detected corrupted pickle file: {mapping_path}")
-                print("Regenerating cache...")
-                
-                # Remove corrupted file
-                os.remove(mapping_path)
-                
-                # Regenerate cache
-                self.build_cache(self.preloaded_dir)
-                return True
-        
-        return False

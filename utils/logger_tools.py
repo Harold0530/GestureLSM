@@ -44,16 +44,18 @@ def set_args_and_logger(args, rank):
     """
     set logger file and print args
     """
-    args_name_dir = args.out_path + "custom/" + args.name + args.notes + "/"
+    args_name_dir = args.output_dir + '/' + args.exp_name
     if rank == 0:
         if not os.path.exists(args_name_dir): os.makedirs(args_name_dir)
-        args_name = args_name_dir + "/" + args.name +".yaml"
+        args_name = args_name_dir + "/" + args.exp_name +".yaml"
+        
         if os.path.exists(args_name):
             s_add = 10
             logger.warning(f"Already exist args, add {s_add} to ran_seed to continue training")
-            args.random_seed += s_add
+            args.seed += s_add
         else:
-            with open(args_name, "w+") as f:
-                yaml.dump(args.__dict__, f, default_flow_style=True)
+            print("init args")
+            # with open(args_name, "w+") as f:
+            #     yaml.dump(args.__dict__, f, default_flow_style=True)
                 #json.dump(args.__dict__, f)
-    setup_logger(args_name_dir, rank, filename=f"{args.name}.txt")
+    setup_logger(args_name_dir, rank, filename=f"{args.exp_name}.txt")

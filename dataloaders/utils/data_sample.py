@@ -99,7 +99,7 @@ def process_data_with_ratio(ori_stride, ori_length, ratio, clip_info, args, is_t
                            lmdb_manager, n_out_samples):
     """Process data with a specific training length ratio."""
     
-    if is_test:
+    if is_test and not args.test_clip:
         cut_length = clip_info['clip_e_f_pose'] - clip_info['clip_s_f_pose']
         args.stride = cut_length
         max_length = cut_length
